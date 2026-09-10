@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+
+# Pre-rendered TTS audio and call transcript logs are generated locally
+# from real API keys / real calls - not checked in.
+apps/backend/assets/*.ulaw
+apps/backend/call-logs/
+
+.DS_Store
