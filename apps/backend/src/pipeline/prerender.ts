@@ -1,10 +1,12 @@
 import "dotenv/config";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { synthesizeSpeech } from "./tts.js";
+import { ElevenLabsTts } from "./tts.js";
 import { disclosureLine, APOLOGY_LINE, DISCLOSURE_AUDIO_FILENAME, APOLOGY_AUDIO_FILENAME } from "./fixedLines.js";
 
 const ASSETS_DIR = join(process.cwd(), "assets");
+// No cached lines here, obviously - this script is what PRODUCES the cache.
+const tts = new ElevenLabsTts([]);
 
 /**
  * One-time script: pre-renders the fixed disclosure and apology-fallback
@@ -16,7 +18,7 @@ const ASSETS_DIR = join(process.cwd(), "assets");
  */
 async function renderLine(text: string, filename: string): Promise<void> {
   const chunks: Buffer[] = [];
-  for await (const frame of synthesizeSpeech(text)) {
+  for await (const frame of tts.synthesize(text)) {
     chunks.push(frame);
   }
   const audio = Buffer.concat(chunks);

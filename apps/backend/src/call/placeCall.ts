@@ -1,8 +1,6 @@
 import { loadConfig } from "../config/index.js";
-import { getTwilioClient, hangupCall } from "./twilioClient.js";
-import { createSession, deleteSession, getSessionByCallSid } from "./sessionStore.js";
-import { OVERALL_CALL_TIMEOUT_MS } from "./types.js";
-import { logCallSummary } from "./logging.js";
+import { getTwilioClient } from "./twilioClient.js";
+import { registerPendingCall } from "./sessionStore.js";
 
 export interface PlaceCallParams {
   to: string;
@@ -14,10 +12,19 @@ export interface PlaceCallResult {
 }
 
 /**
- * Places an outbound call and registers the in-memory session that the
- * Media Stream WS handler and voice webhooks will attach to once Twilio
- * dials in. This is Phase 0-1's only entry point for starting a call - no
- * REST API / task queue yet.
+ * Places an outbound call and registers the pending-call record the
+ * Media Stream WS handler will consume once Twilio actually connects the
+ * call. This is Phase 0-1's only entry point for starting a call - no REST
+ * API / task queue yet.
+ *
+ * No custom pre-answer timeout here: Twilio's own default ring timeout
+ * (~60s) already fires a `no-answer` status callback, which
+ * `/voice/status` already cleans up - a second timer duplicating that would
+ * just be redundant. Once the call is answered and the CallOrchestrator
+ * starts, IT owns the in-conversation overall timeout (see
+ * CallOrchestratorOptions.overallTimeoutMs) - lifecycle decisions live in
+ * one place, not split across Twilio-specific plumbing and the
+ * orchestrator.
  */
 export async function placeCall({ to, objective }: PlaceCallParams): Promise<PlaceCallResult> {
   const config = loadConfig();
@@ -36,32 +43,9 @@ export async function placeCall({ to, objective }: PlaceCallParams): Promise<Pla
     asyncAmdStatusCallbackMethod: "POST",
   });
 
-  const session = createSession(call.sid, objective);
-
-  session.overallTimeoutHandle = setTimeout(() => {
-    void forceEndCall(call.sid, "overall call timeout exceeded");
-  }, OVERALL_CALL_TIMEOUT_MS);
+  registerPendingCall(call.sid, objective);
 
   console.log(`[call] placed call ${call.sid} to ${to}, objective: "${objective}"`);
 
   return { callSid: call.sid };
-}
-
-/**
- * Enforced by the overall wall-clock timeout, and reused by any other path
- * that needs to unconditionally end a call regardless of pipeline state
- * (e.g. an unrecoverable error). Always hangs up via the Twilio REST API
- * and cleans up the in-memory session so nothing leaks.
- */
-export async function forceEndCall(callSid: string, reason: string): Promise<void> {
-  console.warn(`[call] force-ending ${callSid}: ${reason}`);
-  const session = getSessionByCallSid(callSid);
-  if (session) {
-    session.ended = true;
-  }
-  await hangupCall(callSid);
-  if (session) {
-    logCallSummary(session, reason);
-  }
-  deleteSession(callSid);
 }

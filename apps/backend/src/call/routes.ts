@@ -1,10 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import Twilio from "twilio";
 import { loadConfig } from "../config/index.js";
-import { getSessionByCallSid, deleteSession } from "./sessionStore.js";
+import { takePendingCall } from "./sessionStore.js";
 import { hangupCall } from "./twilioClient.js";
 import { placeCall } from "./placeCall.js";
-import { logCallSummary } from "./logging.js";
 
 interface VoiceAnswerBody {
   CallSid: string;
@@ -27,18 +26,6 @@ const DEFAULT_OBJECTIVE =
 
 const TERMINAL_CALL_STATUSES = new Set(["completed", "failed", "busy", "no-answer", "canceled"]);
 
-function cleanUpSession(callSid: string, reason: string): void {
-  const session = getSessionByCallSid(callSid);
-  if (!session || session.ended) return;
-  session.ended = true;
-  if (session.overallTimeoutHandle) {
-    clearTimeout(session.overallTimeoutHandle);
-    session.overallTimeoutHandle = null;
-  }
-  logCallSummary(session, reason);
-  deleteSession(callSid);
-}
-
 /**
  * HTTP routes for this phase: Twilio's voice webhooks (answer/status/AMD)
  * plus one unauthenticated /trigger-call endpoint to kick off a test call.
@@ -52,10 +39,6 @@ export function registerCallRoutes(app: FastifyInstance): void {
     const { CallSid } = request.body;
     const config = loadConfig();
 
-    if (!getSessionByCallSid(CallSid)) {
-      console.error(`[voice] /voice/answer called for unknown callSid ${CallSid} (no matching session)`);
-    }
-
     const wssUrl = `${config.PUBLIC_BASE_URL.replace(/^https:/, "wss:")}/media-stream`;
     const twiml = new Twilio.twiml.VoiceResponse();
     twiml.connect().stream({ url: wssUrl });
@@ -68,11 +51,16 @@ export function registerCallRoutes(app: FastifyInstance): void {
     console.log(`[voice] status callback: ${CallSid} -> ${CallStatus}`);
 
     if (TERMINAL_CALL_STATUSES.has(CallStatus)) {
-      // In the common case the orchestrator already ended and logged the
-      // session itself before Twilio's async status callback arrives; this
-      // only does real work for calls that never got as far as a Media
-      // Stream (e.g. no-answer/busy/failed).
-      cleanUpSession(CallSid, `twilio status: ${CallStatus}`);
+      // If a pending-call record still exists here, the call ended (busy,
+      // no-answer, failed, or hung up) before the Media Stream ever
+      // connected and a CallOrchestrator ever started - there's no
+      // transcript/latency data to log, just note it and clean up. In the
+      // common case the orchestrator already consumed this record and
+      // logged its own summary, so this is a no-op.
+      const pending = takePendingCall(CallSid);
+      if (pending) {
+        console.log(`[voice] call ${CallSid} ended before conversation started (status: ${CallStatus})`);
+      }
     }
 
     reply.code(204).send();
@@ -83,7 +71,8 @@ export function registerCallRoutes(app: FastifyInstance): void {
     console.log(`[voice] AMD result for ${CallSid}: ${AnsweredBy}`);
 
     if (AnsweredBy?.startsWith("machine")) {
-      cleanUpSession(CallSid, `voicemail detected (${AnsweredBy})`);
+      const pending = takePendingCall(CallSid);
+      console.log(`[voice] voicemail detected for ${CallSid}${pending ? "" : " (conversation already started)"}`);
       await hangupCall(CallSid);
     }
 

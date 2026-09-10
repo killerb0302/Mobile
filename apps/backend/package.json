@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && npm run copy-assets",
+    "copy-assets": "mkdir -p dist/pipeline/local/static && cp src/pipeline/local/static/index.html dist/pipeline/local/static/index.html",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "trigger-call": "tsx src/call/trigger.ts",

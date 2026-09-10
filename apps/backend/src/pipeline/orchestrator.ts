@@ -1,232 +1,186 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import type { MediaStreamConnection } from "../media-stream/connection.js";
-import { deleteSession } from "../call/sessionStore.js";
-import { hangupCall } from "../call/twilioClient.js";
-import { logCallSummary } from "../call/logging.js";
-import { CallState, MAX_TURNS, type CallSession, type Speaker, type TurnLatency } from "../call/types.js";
-import { LiveTranscriber } from "./stt.js";
-import { getNextReply } from "./llm.js";
-import { synthesizeSpeech } from "./tts.js";
-import { disclosureLine, APOLOGY_LINE, DISCLOSURE_AUDIO_FILENAME, APOLOGY_AUDIO_FILENAME } from "./fixedLines.js";
+import type { ConversationTransport } from "./transport.js";
+import type { LanguageModel } from "./llmProvider.js";
+import type { TextToSpeechProvider } from "./ttsProvider.js";
+import { CallState, type Speaker, type TranscriptEntry, type TurnLatency } from "./conversationTypes.js";
+import { logCallSummary } from "./logging.js";
 
-const FRAME_BYTES = 160;
-const MARK_TIMEOUT_MS = 10_000;
-
-function chunkFile(filename: string): Buffer[] {
-  const data = readFileSync(join(process.cwd(), "assets", filename));
-  const frames: Buffer[] = [];
-  for (let i = 0; i < data.length; i += FRAME_BYTES) {
-    frames.push(data.subarray(i, Math.min(i + FRAME_BYTES, data.length)));
-  }
-  return frames;
+export interface CallOrchestratorOptions {
+  /** callSid for Twilio mode, a generated session id for local mode - used
+   * only for logging/log-file naming, never branched on. */
+  id: string;
+  objective: string;
+  /** Disclosure text (paid mode) or a friendly greeting (local mode). */
+  openingLine: string;
+  /** Spoken once if any provider call fails unrecoverably mid-conversation. */
+  apologyLine: string;
+  maxTurns: number;
+  overallTimeoutMs: number;
 }
 
 /**
- * Drives one call's entire conversational state machine (DISCLOSURE ->
- * LISTENING -> TRANSCRIBING -> THINKING -> SPEAKING -> ... -> HANGUP) for
- * up to MAX_TURNS turns, wiring together Deepgram STT, Claude, and
- * ElevenLabs TTS over the Media Stream WebSocket. This is the Phase 0-1
- * proof: sustaining a real two-turn back-and-forth with basic barge-in
- * handling, a hard turn/time cap, per-turn latency instrumentation, and a
- * fixed-line fallback if any external dependency fails mid-call.
+ * Provider-agnostic conversation engine. Depends ONLY on the four
+ * capability interfaces (ConversationTransport/LanguageModel/
+ * TextToSpeechProvider - SpeechToText is encapsulated inside whichever
+ * transport is active) - it must never import or branch on a concrete
+ * vendor (no `if Twilio`, `if Deepgram`, `if Ollama`, `if Claude`,
+ * `if Piper` anywhere in this file). Mode selection happens once, in the
+ * wiring layer (server.ts and friends), which constructs the concrete
+ * providers and injects them here.
+ *
+ * Owns the turn cap, the overall session timeout, and the decision to hang
+ * up - transports only expose the *mechanism* (`endCall()`).
  */
-export async function runCallOrchestration(session: CallSession, mediaConn: MediaStreamConnection): Promise<void> {
-  const pendingMarks = new Map<string, () => void>();
-  mediaConn.onMark((name) => {
-    pendingMarks.get(name)?.();
-    pendingMarks.delete(name);
-  });
+export class CallOrchestrator {
+  private state: CallState = CallState.OPENING;
+  private turnCount = 0;
+  private readonly transcript: TranscriptEntry[] = [];
+  private readonly latencies: TurnLatency[] = [];
+  private readonly startedAt = Date.now();
+  private finished = false;
+  private overallTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
-  function waitForMark(name: string): Promise<void> {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        pendingMarks.delete(name);
-        console.warn(`[call ${session.callSid}] timed out waiting for playback mark "${name}"`);
-        resolve();
-      }, MARK_TIMEOUT_MS);
-      pendingMarks.set(name, () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
-  }
+  constructor(
+    private readonly transport: ConversationTransport,
+    private readonly llm: LanguageModel,
+    private readonly tts: TextToSpeechProvider,
+    private readonly options: CallOrchestratorOptions,
+  ) {}
 
-  let markCounter = 0;
-  const transcriber = new LiveTranscriber((err) => void handleFatalError("stt", err));
-  mediaConn.onInboundAudio((chunk) => transcriber.feed(chunk));
+  async run(): Promise<void> {
+    this.overallTimeoutHandle = setTimeout(() => {
+      this.end("overall session timeout exceeded");
+    }, this.options.overallTimeoutMs);
 
-  let finished = false;
-
-  function pushTranscript(speaker: Speaker, text: string, excludeFromLlmHistory = false): void {
-    session.transcript.push({ speaker, text, ts: Date.now(), excludeFromLlmHistory });
-  }
-
-  /**
-   * Streams frames to Twilio, optionally arming barge-in detection. On
-   * barge-in we stop sending remaining frames and flush Twilio's playback
-   * buffer immediately, skipping the mark-wait entirely, per the plan's
-   * "stop talking over the callee, don't try to finish the thought" scope.
-   */
-  async function playFrames(
-    frames: AsyncIterable<Buffer> | Iterable<Buffer>,
-    { interruptible }: { interruptible: boolean },
-  ): Promise<{ interrupted: boolean }> {
-    const state = { interrupted: false };
-    if (interruptible) {
-      transcriber.armBargeInDetector(() => {
-        if (!state.interrupted) {
-          state.interrupted = true;
-          mediaConn.sendClear();
-        }
-      });
-    }
     try {
-      for await (const frame of frames) {
-        if (state.interrupted) break;
-        mediaConn.sendAudioFrame(frame);
+      await this.transport.waitUntilReady?.();
+
+      this.state = CallState.OPENING;
+      this.pushTranscript("agent", this.options.openingLine, true);
+      await this.transport.playAudio(this.tts.synthesize(this.options.openingLine), { interruptible: false });
+
+      while (this.turnCount < this.options.maxTurns && !this.finished) {
+        await this.runTurn();
       }
-    } finally {
-      if (interruptible) transcriber.armBargeInDetector(null);
+
+      if (!this.finished) {
+        this.end(this.turnCount >= this.options.maxTurns ? "reached max turn cap" : "conversation loop ended");
+      }
+    } catch (err) {
+      await this.handleFatalError("orchestrator", err);
     }
-    if (!state.interrupted) {
-      const markName = `mark-${++markCounter}`;
-      mediaConn.sendMark(markName);
-      await waitForMark(markName);
-    }
-    return state;
   }
 
-  async function playPrerendered(filename: string): Promise<void> {
-    await playFrames(chunkFile(filename), { interruptible: false });
+  private pushTranscript(speaker: Speaker, text: string, excludeFromLlmHistory = false): void {
+    this.transcript.push({ speaker, text, ts: Date.now(), excludeFromLlmHistory });
+  }
+
+  private async runTurn(): Promise<void> {
+    const turnNumber = this.turnCount + 1;
+    const latency: TurnLatency = { turn: turnNumber, sttMs: null, llmMs: null, ttsMs: null, totalMs: null };
+
+    this.state = CallState.LISTENING;
+    let utterance: { transcript: string; sttMs: number | null };
+    try {
+      utterance = await this.transport.waitForUtterance();
+    } catch (err) {
+      console.warn(`[orchestrator ${this.options.id}] turn ${turnNumber}: ${err instanceof Error ? err.message : err}`);
+      this.end("no response from the other party");
+      return;
+    }
+    const turnStart = Date.now();
+    latency.sttMs = utterance.sttMs;
+    this.pushTranscript("callee", utterance.transcript);
+
+    this.state = CallState.THINKING;
+    let reply: string;
+    try {
+      const llmResult = await this.llm.getNextReply(this.options.objective, this.transcript);
+      latency.llmMs = llmResult.llmMs;
+      reply = llmResult.reply;
+    } catch (err) {
+      await this.handleFatalError("llm", err);
+      return;
+    }
+    this.pushTranscript("agent", reply);
+
+    this.state = CallState.SPEAKING;
+    let interrupted: boolean;
+    try {
+      const timing = { ttsMs: null as number | null, totalMs: null as number | null };
+      const result = await this.transport.playAudio(this.timedSynthesis(reply, turnStart, timing), {
+        interruptible: true,
+      });
+      interrupted = result.interrupted;
+      latency.ttsMs = timing.ttsMs;
+      latency.totalMs = timing.totalMs;
+    } catch (err) {
+      await this.handleFatalError("tts", err);
+      return;
+    }
+
+    this.turnCount = turnNumber;
+    this.latencies.push(latency);
+    console.log(`[orchestrator ${this.options.id}] turn ${turnNumber} latency (ms):`, latency);
+
+    if (interrupted) {
+      console.log(`[orchestrator ${this.options.id}] turn ${turnNumber}: barge-in detected, returning to LISTENING`);
+    }
   }
 
   /**
-   * Runs one ElevenLabs TTS request and streams it out, measuring
-   * time-to-first-audio-byte (relative to the TTS request itself) and
-   * total-turn-latency (relative to `turnStart`, i.e. end of callee
-   * speech) at the same measurement point for accuracy.
+   * Wraps tts.synthesize() to measure time-to-first-audio-byte (relative to
+   * the TTS request itself) and the critical end-to-end metric - end of
+   * callee speech (`turnStart`) to first agent audio byte - at the same
+   * measurement point, to avoid drift from summing separate estimates.
    */
-  async function speakAndWait(
+  private async *timedSynthesis(
     text: string,
     turnStart: number,
-    opts: { interruptible: boolean },
-  ): Promise<{ interrupted: boolean; ttsMs: number; totalMs: number }> {
+    out: { ttsMs: number | null; totalMs: number | null },
+  ): AsyncGenerator<Buffer> {
     const ttsRequestStart = Date.now();
-    let ttsMs = -1;
-    let totalMs = -1;
-
-    async function* timed(): AsyncGenerator<Buffer> {
-      let first = true;
-      for await (const frame of synthesizeSpeech(text)) {
-        if (first) {
-          const now = Date.now();
-          ttsMs = now - ttsRequestStart;
-          totalMs = now - turnStart;
-          first = false;
-        }
-        yield frame;
+    let first = true;
+    for await (const frame of this.tts.synthesize(text)) {
+      if (first) {
+        const now = Date.now();
+        out.ttsMs = now - ttsRequestStart;
+        out.totalMs = now - turnStart;
+        first = false;
       }
+      yield frame;
     }
-
-    const { interrupted } = await playFrames(timed(), opts);
-    return { interrupted, ttsMs, totalMs };
   }
 
-  function endCall(reason: string): void {
-    if (finished) return;
-    finished = true;
-    transcriber.close();
-    if (session.overallTimeoutHandle) {
-      clearTimeout(session.overallTimeoutHandle);
-      session.overallTimeoutHandle = null;
-    }
-    session.ended = true;
-    logCallSummary(session, reason);
-    deleteSession(session.callSid);
-    void hangupCall(session.callSid);
-    mediaConn.close();
-  }
-
-  async function handleFatalError(stage: string, err: unknown): Promise<void> {
-    if (finished) return;
-    console.error(`[call ${session.callSid}] fatal error in ${stage}, ending call:`, err);
+  private async handleFatalError(stage: string, err: unknown): Promise<void> {
+    if (this.finished) return;
+    console.error(`[orchestrator ${this.options.id}] fatal error in ${stage}, ending call:`, err);
     try {
-      if (stage === "tts") {
-        // TTS itself is broken - fall back to the pre-rendered static clip
-        // since we can't synthesize a dynamic apology either.
-        await playPrerendered(APOLOGY_AUDIO_FILENAME);
-      } else {
-        const { interrupted } = await speakAndWait(APOLOGY_LINE, Date.now(), { interruptible: false });
-        void interrupted;
-      }
+      await this.transport.playAudio(this.tts.synthesize(this.options.apologyLine), { interruptible: false });
     } catch (apologyErr) {
-      console.error(`[call ${session.callSid}] apology fallback also failed:`, apologyErr);
+      console.error(`[orchestrator ${this.options.id}] apology fallback also failed:`, apologyErr);
     }
-    endCall(`error in ${stage}: ${err instanceof Error ? err.message : String(err)}`);
+    this.end(`error in ${stage}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  try {
-    await transcriber.waitUntilReady();
-
-    session.state = CallState.DISCLOSURE;
-    pushTranscript("agent", disclosureLine(), true);
-    await playPrerendered(DISCLOSURE_AUDIO_FILENAME);
-
-    while (session.turnCount < MAX_TURNS && !finished) {
-      const turnNumber = session.turnCount + 1;
-      const latency: TurnLatency = { turn: turnNumber, sttMs: null, llmMs: null, ttsMs: null, totalMs: null };
-
-      session.state = CallState.LISTENING;
-      let utterance;
-      try {
-        utterance = await transcriber.waitForUtterance();
-      } catch (err) {
-        console.warn(`[call ${session.callSid}] turn ${turnNumber}: ${err instanceof Error ? err.message : err}`);
-        break;
-      }
-      const turnStart = Date.now();
-      latency.sttMs = utterance.firstTranscriptMs;
-      pushTranscript("callee", utterance.transcript);
-
-      session.state = CallState.TRANSCRIBING;
-
-      session.state = CallState.THINKING;
-      let llmResult;
-      try {
-        llmResult = await getNextReply(session.objective, session.transcript);
-      } catch (err) {
-        await handleFatalError("llm", err);
-        return;
-      }
-      latency.llmMs = llmResult.llmMs;
-      pushTranscript("agent", llmResult.reply);
-
-      session.state = CallState.SPEAKING;
-      session.isSpeaking = true;
-      let speakResult;
-      try {
-        speakResult = await speakAndWait(llmResult.reply, turnStart, { interruptible: true });
-      } catch (err) {
-        await handleFatalError("tts", err);
-        return;
-      }
-      session.isSpeaking = false;
-      latency.ttsMs = speakResult.ttsMs;
-      latency.totalMs = speakResult.totalMs;
-
-      session.turnCount = turnNumber;
-      session.latencies.push(latency);
-      console.log(`[call ${session.callSid}] turn ${turnNumber} latency (ms):`, latency);
-
-      if (speakResult.interrupted) {
-        console.log(`[call ${session.callSid}] turn ${turnNumber}: barge-in detected, returning to LISTENING`);
-      }
+  private end(reason: string): void {
+    if (this.finished) return;
+    this.finished = true;
+    if (this.overallTimeoutHandle) {
+      clearTimeout(this.overallTimeoutHandle);
+      this.overallTimeoutHandle = null;
     }
-
-    session.state = CallState.HANGUP;
-    endCall(session.turnCount >= MAX_TURNS ? "reached max turn cap" : "conversation loop ended");
-  } catch (err) {
-    await handleFatalError("orchestrator", err);
+    this.state = CallState.HANGUP;
+    logCallSummary(
+      {
+        id: this.options.id,
+        objective: this.options.objective,
+        startedAt: this.startedAt,
+        transcript: this.transcript,
+        latencies: this.latencies,
+        turnCount: this.turnCount,
+      },
+      reason,
+    );
+    void this.transport.endCall(reason);
   }
 }

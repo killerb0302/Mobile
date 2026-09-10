@@ -1,32 +1,16 @@
-import { type CallSession, createCallSession } from "./types.js";
+import type { PendingCall } from "./types.js";
 
-const sessionsByCallSid = new Map<string, CallSession>();
-const callSidByStreamSid = new Map<string, string>();
+const pendingCalls = new Map<string, PendingCall>();
 
-export function createSession(callSid: string, objective: string): CallSession {
-  const session = createCallSession(callSid, objective);
-  sessionsByCallSid.set(callSid, session);
-  return session;
+export function registerPendingCall(callSid: string, objective: string): void {
+  pendingCalls.set(callSid, { callSid, objective, createdAt: Date.now() });
 }
 
-export function getSessionByCallSid(callSid: string): CallSession | undefined {
-  return sessionsByCallSid.get(callSid);
-}
-
-export function linkStreamToCall(streamSid: string, callSid: string): void {
-  callSidByStreamSid.set(streamSid, callSid);
-}
-
-export function getSessionByStreamSid(streamSid: string): CallSession | undefined {
-  const callSid = callSidByStreamSid.get(streamSid);
-  if (!callSid) return undefined;
-  return sessionsByCallSid.get(callSid);
-}
-
-export function deleteSession(callSid: string): void {
-  const session = sessionsByCallSid.get(callSid);
-  if (session?.streamSid) {
-    callSidByStreamSid.delete(session.streamSid);
-  }
-  sessionsByCallSid.delete(callSid);
+/** Looks up and removes a pending call (consumed exactly once - by either
+ * the Media Stream handler starting the orchestrator, or a terminal Twilio
+ * status callback for a call that never got that far). */
+export function takePendingCall(callSid: string): PendingCall | undefined {
+  const call = pendingCalls.get(callSid);
+  if (call) pendingCalls.delete(callSid);
+  return call;
 }

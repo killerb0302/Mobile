@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Local Voice Agent Demo</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #111; color: #eee; }
+  h1 { font-size: 1.25rem; }
+  #status { color: #999; margin-bottom: 24px; min-height: 1.5em; }
+  #talkBtn {
+    width: 100%; padding: 32px; font-size: 1.1rem; border-radius: 12px; border: none;
+    background: #2563eb; color: white; cursor: pointer; user-select: none; -webkit-user-select: none;
+    touch-action: none;
+  }
+  #talkBtn:active, #talkBtn.recording { background: #dc2626; }
+  #talkBtn:disabled { background: #444; cursor: not-allowed; }
+  #transcript { margin-top: 24px; white-space: pre-wrap; line-height: 1.5; }
+  .agent { color: #60a5fa; }
+  .callee { color: #34d399; }
+  .meta { color: #666; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+  <h1>Local Voice Agent Demo (free / offline)</h1>
+  <div id="status">connecting...</div>
+  <button id="talkBtn" disabled>Hold to talk</button>
+  <div id="transcript"></div>
+
+<script>
+(() => {
+  const statusEl = document.getElementById("status");
+  const btn = document.getElementById("talkBtn");
+  const transcriptEl = document.getElementById("transcript");
+
+  const RECORD_SAMPLE_RATE = 16000;
+
+  let ws;
+  let audioCtx;
+  let micStream;
+  let micSource;
+  let processor;
+  let recording = false;
+  let recordedChunks = [];
+
+  // Playback scheduling state
+  let playbackSampleRate = 22050;
+  let nextStartTime = 0;
+  let scheduledSources = [];
+
+  function setStatus(text) { statusEl.textContent = text; }
+
+  function appendLine(speaker, text) {
+    const div = document.createElement("div");
+    div.className = speaker;
+    div.textContent = (speaker === "agent" ? "Agent: " : "You: ") + text;
+    transcriptEl.appendChild(div);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/local-call`);
+    ws.onopen = () => {
+      setStatus("connected - hold the button and talk");
+      btn.disabled = false;
+      ws.send(JSON.stringify({ type: "start" }));
+    };
+    ws.onclose = () => {
+      setStatus("disconnected");
+      btn.disabled = true;
+    };
+    ws.onerror = () => setStatus("connection error");
+    ws.onmessage = (event) => handleServerMessage(JSON.parse(event.data));
+  }
+
+  function handleServerMessage(msg) {
+    switch (msg.type) {
+      case "config":
+        playbackSampleRate = msg.sampleRate;
+        break;
+      case "audio-start":
+        setStatus("agent is responding...");
+        break;
+      case "audio":
+        playChunk(base64ToBytes(msg.audio));
+        break;
+      case "audio-stop":
+        stopPlayback();
+        break;
+      case "audio-end":
+        setStatus("hold the button and talk");
+        break;
+      case "transcript":
+        appendLine(msg.speaker, msg.text);
+        break;
+      case "ended":
+        setStatus(`call ended: ${msg.reason}`);
+        btn.disabled = true;
+        break;
+    }
+  }
+
+  function base64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function ensureAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+  }
+
+  // --- Playback: raw 16-bit PCM mono chunks from Piper, scheduled back-to-back ---
+  function playChunk(bytes) {
+    const ctx = ensureAudioCtx();
+    const sampleCount = bytes.length / 2;
+    const float32 = new Float32Array(sampleCount);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let i = 0; i < sampleCount; i++) {
+      float32[i] = view.getInt16(i * 2, true) / 32768;
+    }
+    const buffer = ctx.createBuffer(1, sampleCount, playbackSampleRate);
+    buffer.copyToChannel(float32, 0);
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+
+    const startAt = Math.max(nextStartTime, ctx.currentTime);
+    source.start(startAt);
+    nextStartTime = startAt + buffer.duration;
+    scheduledSources.push(source);
+    source.onended = () => {
+      scheduledSources = scheduledSources.filter((s) => s !== source);
+    };
+  }
+
+  function stopPlayback() {
+    for (const source of scheduledSources) {
+      try { source.stop(); } catch (e) { /* already stopped */ }
+    }
+    scheduledSources = [];
+    nextStartTime = 0;
+  }
+
+  // --- Recording: mic capture -> 16kHz mono 16-bit PCM WAV ---
+  async function ensureMic() {
+    if (micStream) return;
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ctx = ensureAudioCtx();
+    micSource = ctx.createMediaStreamSource(micStream);
+    processor = ctx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (!recording) return;
+      recordedChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    micSource.connect(processor);
+    processor.connect(ctx.destination); // required by some browsers for onaudioprocess to fire; volume is silent via a zero-gain node in practice, but kept simple here
+  }
+
+  function downsample(float32, fromRate, toRate) {
+    if (toRate === fromRate) return float32;
+    const ratio = fromRate / toRate;
+    const newLength = Math.round(float32.length / ratio);
+    const result = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+      result[i] = float32[Math.floor(i * ratio)];
+    }
+    return result;
+  }
+
+  function encodeWav(float32, sampleRate) {
+    const buffer = new ArrayBuffer(44 + float32.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + float32.length * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, float32.length * 2, true);
+
+    let offset = 44;
+    for (let i = 0; i < float32.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buffer;
+  }
+
+  function bytesToBase64(buffer) {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  async function startRecording() {
+    await ensureMic();
+    if (scheduledSources.length > 0) {
+      stopPlayback();
+      ws.send(JSON.stringify({ type: "interrupt" }));
+    }
+    recordedChunks = [];
+    recording = true;
+    btn.classList.add("recording");
+    btn.textContent = "Recording... release to send";
+  }
+
+  function stopRecording() {
+    if (!recording) return;
+    recording = false;
+    btn.classList.remove("recording");
+    btn.textContent = "Hold to talk";
+
+    const totalLength = recordedChunks.reduce((sum, c) => sum + c.length, 0);
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of recordedChunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    recordedChunks = [];
+
+    const nativeRate = audioCtx.sampleRate;
+    const resampled = downsample(merged, nativeRate, RECORD_SAMPLE_RATE);
+    const wavBuffer = encodeWav(resampled, RECORD_SAMPLE_RATE);
+    const base64 = bytesToBase64(wavBuffer);
+
+    ws.send(JSON.stringify({ type: "utterance", audio: base64 }));
+    setStatus("thinking...");
+  }
+
+  btn.addEventListener("mousedown", startRecording);
+  btn.addEventListener("touchstart", (e) => { e.preventDefault(); startRecording(); });
+  btn.addEventListener("mouseup", stopRecording);
+  btn.addEventListener("mouseleave", () => { if (recording) stopRecording(); });
+  btn.addEventListener("touchend", (e) => { e.preventDefault(); stopRecording(); });
+
+  connect();
+})();
+</script>
+</body>
+</html>
