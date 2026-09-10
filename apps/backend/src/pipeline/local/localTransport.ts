@@ -40,6 +40,17 @@ export class LocalConversationTransport implements ConversationTransport {
     private readonly sessionId: string,
   ) {
     this.ws.on("message", (raw: Buffer) => this.handleMessage(raw));
+    // If the browser tab just closes (not a graceful "ended" from our side),
+    // reject whatever this transport is currently waiting on so the
+    // orchestrator's existing error handling ends the session and logs a
+    // summary - otherwise a closed tab would leave the orchestrator running
+    // silently until the overall session timeout eventually fires.
+    this.ws.on("close", () => {
+      if (this.pendingUtterance) {
+        this.pendingUtterance.reject(new Error(`WebSocket closed for session ${this.sessionId}`));
+        this.pendingUtterance = null;
+      }
+    });
   }
 
   async waitUntilReady(): Promise<void> {
